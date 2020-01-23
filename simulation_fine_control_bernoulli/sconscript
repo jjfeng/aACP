@@ -1,0 +1,414 @@
+import os
+
+from os.path import join
+from nestly.scons import SConsWrap
+from nestly import Nest
+from SCons.Script import Environment, Command, AddOption
+import numpy as np
+
+Import('env')
+localenv = env.Clone()
+
+nest = SConsWrap(Nest(), localenv['output'], alias_environment=localenv)
+
+MAIN_WINDOW = 15
+MAIN_NI_MARGIN = 0.05
+WINDOWS = [1, 15, 25, 50]
+NI_MARGINS = [0, 0.01, 0.05, 0.1]
+
+NUM_TEST_OBS = 40000
+TYPE_I_ERROR = 0.05
+DENOM_MIN = 1
+MFDR = 0.2
+SIMULATION_DICT = {
+    "moody": {
+        "updater": "moody",
+        "increment": 0.01,
+        "num_batches": 100,
+        "batch_size": 200,
+        "batch_incr": 0,
+        "noise": 0.35,
+        "init_period": 15,
+        "period": 10,
+        "max_wait": 5},
+    "adversary": {
+        "updater": "fine_control",
+        "increment": -0.025,
+        "num_batches": 200,
+        "batch_size": 200,
+        "batch_incr": 10,
+        "noise": 0.05,
+        "period": None,
+        "max_wait": 5},
+    "nice": {
+        "updater": "fine_control",
+        "increment": 0.04,
+        "num_batches": 20,
+        "batch_size": 650,
+        "batch_incr": 0,
+        "noise": 0.4,
+        "period": None,
+        "max_wait": 3},
+}
+MFDR_DICT = {
+    "BAC": {
+        "mfdr": MFDR,
+        "aacp": "BAC",
+        "alpha_use": 1,
+    },
+    "BABR": {
+        "mfdr": MFDR,
+        "alpha_use": 1.6,
+        "aacp": "BABR",
+    },
+}
+
+MFDR_SETTINGS = ["BAC", "BABR"]
+APPROVERS = ["Fixed","Reset", "Baseline", "Blind"]
+ALL_AACPS = MFDR_SETTINGS + APPROVERS
+
+nest.add(
+    "setting",
+    [
+        "moody",
+        "adversary",
+        "nice"
+    ]
+)
+
+nest.add_aggregate('aggregate_res', dict)
+nest.add_aggregate('aggregate_res_list', list)
+
+nest.add(
+    'seed',
+    range(1),
+    label_func=lambda c: 'seed_%d' % c)
+
+@nest.add_target_with_env(localenv)
+def generate(env, outdir, c):
+    targets = [
+        join(outdir, 'obs_data.pkl'),
+        join(outdir, 'data_log.txt')]
+    cmd = [
+        'python generate_trial_data.py',
+        '--density-parametric bernoulli',
+        '--first-batch',
+        SIMULATION_DICT[c['setting']]['batch_size'],
+        '--batch-size',
+        SIMULATION_DICT[c['setting']]['batch_size'],
+        '--batch-incr',
+        SIMULATION_DICT[c['setting']]['batch_incr'],
+        '--num-batches',
+        SIMULATION_DICT[c['setting']]['num_batches'],
+        '--num-p 1',
+        '--seed',
+        c['seed'],
+	'--out-file ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}']
+    return env.Command(
+        targets,
+        [],
+        ' '.join(map(str, cmd)))
+
+
+nest.add(
+    "ni_margin",
+    NI_MARGINS,
+    label_func=lambda c: 'ni_margin_%d' % int(100 * c),
+)
+
+nest.add(
+    "window",
+    lambda c: WINDOWS if c['ni_margin'] == MAIN_NI_MARGIN else [MAIN_WINDOW],
+    label_func=lambda c: 'window_%d' % c,
+)
+
+nest.add('mfdr_setting', MFDR_SETTINGS)
+
+@nest.add_target_with_env(localenv)
+def run_mfdr_simulation(env, outdir, c):
+    targets = [
+        join(outdir, 'approver_repeat.pkl'),
+        join(outdir, 'approver_repeat_log.txt')]
+    period_str = '--proposer-period %d --proposer-init-period %d' % (SIMULATION_DICT[c['setting']]['period'], SIMULATION_DICT[c['setting']]['init_period']) if SIMULATION_DICT[c['setting']]['period'] else ''
+    cmd = [
+        'python run_approval_mfdr.py',
+        '--data ${SOURCES[0]}',
+        '--seed',
+        c['seed'] + 1,
+        '--update-engine',
+        SIMULATION_DICT[c['setting']]['updater'],
+        '--proposer-noise',
+        SIMULATION_DICT[c['setting']]['noise'],
+        '--proposer-increment',
+        SIMULATION_DICT[c['setting']]['increment'],
+        '--window',
+        c['window'],
+        '--ni-margin',
+        c['ni_margin'],
+        period_str,
+        '--max-wait',
+        SIMULATION_DICT[c['setting']]['max_wait'],
+        '--approval-policy',
+        MFDR_DICT[c['mfdr_setting']]['aacp'],
+        '--mptvr',
+        MFDR_DICT[c['mfdr_setting']]['mfdr'],
+        '--denom-min',
+        DENOM_MIN,
+        '--alpha-use-factor',
+        MFDR_DICT[c['mfdr_setting']]['alpha_use'],
+        '--type-i-error',
+        TYPE_I_ERROR,
+	'--out-file ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}']
+    return env.Command(
+        targets,
+        c['generate'],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def evaluate_approver(env, outdir, c):
+    targets = [
+        join(outdir, 'eval_repeat.pkl'),
+        join(outdir, 'eval_repeat_log.txt')]
+    cmd = [
+        'python evaluate_approver.py',
+        '--data ${SOURCES[0]}',
+        '--approver ${SOURCES[1]}',
+        '--seed',
+        c['seed'] + 2,
+        '--window',
+        c['window'],
+        '--ni-margin',
+        c['ni_margin'],
+        '--num-test-obs',
+        NUM_TEST_OBS,
+	'--out-file ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}']
+    c['aggregate_res'][(c['mfdr_setting'], c['ni_margin'], c['window'])] = targets[0]
+    c['aggregate_res_list'].append(targets[0])
+    return env.Command(
+        targets,
+        [
+           c['generate'][0],
+           c['run_mfdr_simulation'][0],
+        ],
+        ' '.join(map(str, cmd)))
+
+nest.pop('mfdr_setting')
+
+nest.add('approver', APPROVERS)
+
+@nest.add_target_with_env(localenv)
+def run_simulation(env, outdir, c):
+    targets = [
+        join(outdir, 'approver_repeat.pkl'),
+        join(outdir, 'approver_repeat_log.txt')]
+    approver_str = c["approver"].replace("_superiority", "")
+    ni_margin = 0 if "superiority" in c["approver"] else c['ni_margin']
+    period_str = '--proposer-period %d' % SIMULATION_DICT[c['setting']]['period'] if SIMULATION_DICT[c['setting']]['period'] else ''
+    cmd = [
+        'python run_approval_simulation.py',
+        '--data ${SOURCES[0]}',
+        '--seed',
+        c['seed'] + 1,
+        '--update-engine',
+        SIMULATION_DICT[c['setting']]['updater'],
+        '--proposer-noise',
+        SIMULATION_DICT[c['setting']]['noise'],
+        '--proposer-increment',
+        SIMULATION_DICT[c['setting']]['increment'],
+        period_str,
+        '--approval-policy',
+        approver_str,
+        '--ni-margin',
+        ni_margin,
+        '--max-wait',
+        SIMULATION_DICT[c['setting']]['max_wait'],
+        '--type-i-error',
+        TYPE_I_ERROR,
+	'--out-file ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}']
+    return env.Command(
+        targets,
+        c['generate'],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def evaluate_approver_reg(env, outdir, c):
+    targets = [
+        join(outdir, 'eval_repeat.pkl'),
+        join(outdir, 'eval_repeat_log.txt')]
+    cmd = [
+        'python evaluate_approver.py',
+        '--data ${SOURCES[0]}',
+        '--approver ${SOURCES[1]}',
+        '--seed',
+        c['seed'] + 2,
+        '--window',
+        c['window'],
+        '--ni-margin',
+        c['ni_margin'],
+        '--num-test-obs',
+        NUM_TEST_OBS,
+	'--out-file ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}']
+    c['aggregate_res'][(c['approver'], c['ni_margin'], c['window'])] = targets[0]
+    c['aggregate_res_list'].append(targets[0])
+    return env.Command(
+        targets,
+        [
+           c['generate'][0],
+           c['run_simulation'][0],
+        ],
+        ' '.join(map(str, cmd)))
+
+nest.pop('seed')
+
+@nest.add_target_with_env(localenv)
+def plot_performance_window_variation(env, outdir, c):
+    targets = [join(outdir, 'window_var_perf_plot.pdf')]
+    result_names = []
+    result_paths = []
+    windows = []
+    for approver_name in ALL_AACPS:
+        for window in WINDOWS:
+            approver_key = (approver_name, MAIN_NI_MARGIN, window)
+            if approver_key not in c['aggregate_res']:
+                continue
+            result_names.append(approver_name)
+            windows.append(window)
+            approver_path = c['aggregate_res'][approver_key]
+            split_path = approver_path.split("/")
+            split_path[2] = "seed_*"
+            split_path = ["simulation_fine_control_bernoulli"] + split_path
+            result_paths.append("/".join(split_path))
+
+    cmd = [
+        "python plot_performance.py",
+        '--out-plot ${TARGETS[0]}',
+        '--endpoint Specificity',
+        '--meta-name "Window size"',
+        '--meta-type int',
+        '--meta-val',
+        ','.join(map(str, windows)),
+        '--result-names',
+        ",".join(result_names),
+        '--result-files',
+        ",".join(result_paths),
+        '--hide-legend',
+    ]
+    return env.Command(
+        targets,
+        c['aggregate_res_list'],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def plot_performance_eps_variation(env, outdir, c):
+    targets = [join(outdir, 'ni_var_perf_plot.pdf')]
+    result_names = []
+    result_paths = []
+    ni_margins = []
+    for approver_name in ALL_AACPS:
+        for ni_margin in NI_MARGINS:
+            approver_key = (approver_name, ni_margin, MAIN_WINDOW)
+            if approver_key not in c['aggregate_res']:
+                continue
+            result_names.append(approver_name)
+            ni_margins.append(ni_margin)
+            approver_path = c['aggregate_res'][approver_key]
+            split_path = approver_path.split("/")
+            split_path[2] = "seed_*"
+            split_path = ["simulation_fine_control_bernoulli"] + split_path
+            result_paths.append("/".join(split_path))
+
+    cmd = [
+        "python plot_performance.py",
+        '--out-plot ${TARGETS[0]}',
+        '--endpoint Specificity',
+        '--meta-name "NI margin"',
+        '--meta-type float',
+        '--meta-val',
+        ','.join(map(str, ni_margins)),
+        '--result-names',
+        ",".join(result_names),
+        '--result-files',
+        ",".join(result_paths),
+        '--hide-legend',
+    ]
+    return env.Command(
+        targets,
+        c['aggregate_res_list'],
+        ' '.join(map(str, cmd)))
+
+nest.add(
+    "ni_margin",
+    [MAIN_NI_MARGIN],
+    label_func=lambda c: 'agg_ni_margin_%d' % int(100 * c),
+)
+
+nest.add(
+    "window",
+    [MAIN_WINDOW],
+    label_func=lambda c: 'agg_window_%d' % c,
+)
+
+@nest.add_target_with_env(localenv)
+def plot_performance(env, outdir, c):
+    targets = [join(outdir, 'perf_plot.pdf')]
+    result_names = []
+    result_paths = []
+    for approver_name in ALL_AACPS:
+        approver_key = (approver_name, c['ni_margin'], c['window'])
+        if approver_key not in c['aggregate_res']:
+            continue
+        result_names.append(approver_name)
+        approver_path = c['aggregate_res'][approver_key]
+        split_path = approver_path.split("/")
+        split_path[2] = "seed_*"
+        split_path = ["simulation_fine_control_bernoulli"] + split_path
+        result_paths.append("/".join(split_path))
+
+    cmd = [
+        "python plot_performance.py",
+        '--out-plot ${TARGETS[0]}',
+        '--result-names',
+        ",".join(result_names),
+        '--result-files',
+        ",".join(result_paths),
+    ]
+    return env.Command(
+        targets,
+        c['aggregate_res_list'],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def tabulate_results(env, outdir, c):
+    targets = [join(outdir, 'results_test.csv')]
+    result_names = []
+    result_paths = []
+    for approver_name in ALL_AACPS:
+        approver_key = (approver_name, c['ni_margin'], c['window'])
+        if approver_key not in c['aggregate_res']:
+            continue
+        result_names.append(approver_name)
+        approver_path = c['aggregate_res'][approver_key]
+        split_path = approver_path.split("/")
+        split_path[2] = "seed_*"
+        split_path = ["simulation_fine_control_bernoulli"] + split_path
+        result_paths.append("/".join(split_path))
+
+    cmd = [
+        "python plot_simulation.py",
+        '--denom-min',
+        DENOM_MIN,
+        '--out-csv ${TARGETS[0]}',
+        '--result-names',
+        ",".join(result_names),
+        '--result-files',
+        ",".join(result_paths),
+    ]
+    return env.Command(
+        targets,
+        c['aggregate_res_list'],
+        ' '.join(map(str, cmd)))

@@ -1,0 +1,218 @@
+import os
+
+from os.path import join
+from nestly.scons import SConsWrap
+from nestly import Nest
+from SCons.Script import Environment, Command, AddOption
+import numpy as np
+
+Import('env')
+localenv = env.Clone()
+
+nest = SConsWrap(Nest(), localenv['output'], alias_environment=localenv)
+
+NI_MARGIN = 0.05
+WINDOW = 15
+MFDR = 0.2
+NUM_TEST_OBS = 40000
+BATCH_SIZE = 300
+BATCH_INCR = 0
+NUM_BATCHES = 100
+TYPE_I_ERROR = 0.05
+PROPOSER = "fine_control_simple"
+SIMULATION_DICT = {
+    "no-trend": {
+        "ni_margin": NI_MARGIN,
+        "window": WINDOW,
+        "updater": PROPOSER,
+        "decay": 0.0,
+        "offset": 0,
+        "increment": -0.01,
+        "noise": 0.3,
+        "max_wait": 5},
+    "graph-constant": {
+        "ni_margin": NI_MARGIN,
+        "window": WINDOW,
+        "updater": PROPOSER,
+        "decay": 0.2,
+        "offset": 0,
+        "increment": -0.01,
+        "noise": 0.3,
+        "max_wait": 5},
+    "graph-changing": {
+        "ni_margin": NI_MARGIN,
+        "window": WINDOW,
+        "updater": PROPOSER,
+        "decay": 0.2,
+        "offset": 3.14,
+        "increment": -0.05,
+        "noise": 0.3,
+        "max_wait": 5},
+}
+MFDR_DICT = {
+    "Fixed": {
+        "mfdr": 0.0000001,
+        "aacp": "BAC",
+        "alpha_use": 1,
+    },
+    "BAC": {
+        "mfdr": MFDR,
+        "aacp": "BAC",
+        "alpha_use": 1,
+    },
+    "BABR": {
+        "mfdr": MFDR,
+        "alpha_use": 1.6,
+        "aacp": "BABR",
+    },
+}
+
+ALL_AACPS = ["Fixed", "BAC", "BABR"]
+
+nest.add_aggregate('aggregate_res', dict)
+nest.add_aggregate('aggregate_res_list', list)
+
+nest.add(
+    'seed',
+    range(1),
+    label_func=lambda c: 'seed_%d' % c)
+
+@nest.add_target_with_env(localenv)
+def generate(env, outdir, c):
+    targets = [
+        join(outdir, 'obs_data.pkl'),
+        join(outdir, 'data_log.txt')]
+    cmd = [
+        'python generate_trial_data.py',
+        '--density-parametric bernoulli',
+        '--first-batch',
+        BATCH_SIZE,
+        '--batch-size',
+        BATCH_SIZE,
+        '--batch-incr',
+        BATCH_INCR,
+        '--num-batches',
+        NUM_BATCHES,
+        '--num-p 1',
+        '--seed',
+        c['seed'],
+	'--out-file ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}']
+    return env.Command(
+        targets,
+        [],
+        ' '.join(map(str, cmd)))
+
+nest.add(
+    "setting",
+    [
+        "no-trend",
+        "graph-constant",
+        "graph-changing",
+    ]
+)
+
+nest.add('mfdr_setting', ALL_AACPS)
+
+@nest.add_target_with_env(localenv)
+def run_mfdr_simulation(env, outdir, c):
+    targets = [
+        join(outdir, 'fitted_repeat.pkl'),
+        join(outdir, 'log_repeat.txt')]
+    cmd = [
+        'python run_approval_mfdr.py',
+        '--data ${SOURCES[0]}',
+        '--seed',
+        c['seed'] + 1,
+        '--update-engine',
+        SIMULATION_DICT[c['setting']]['updater'],
+        '--proposer-noise',
+        SIMULATION_DICT[c['setting']]['noise'],
+        '--proposer-increment',
+        SIMULATION_DICT[c['setting']]['increment'],
+        '--proposer-decay',
+        SIMULATION_DICT[c['setting']]['decay'],
+        '--proposer-offset',
+        SIMULATION_DICT[c['setting']]['offset'],
+        '--max-wait',
+        SIMULATION_DICT[c['setting']]['max_wait'],
+        '--ni-margin',
+        SIMULATION_DICT[c['setting']]['ni_margin'],
+        '--window',
+        SIMULATION_DICT[c['setting']]['window'],
+        '--approval-policy',
+        MFDR_DICT[c['mfdr_setting']]['aacp'],
+        '--mptvr',
+        MFDR_DICT[c['mfdr_setting']]['mfdr'],
+        '--denom-min 1',
+        '--alpha-use-factor',
+        MFDR_DICT[c['mfdr_setting']]['alpha_use'],
+        '--type-i-error',
+        TYPE_I_ERROR * 1.5,
+        '--num-test-obs',
+        NUM_TEST_OBS,
+	'--out-file ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}']
+    return env.Command(
+        targets,
+        c['generate'],
+        ' '.join(map(str, cmd)))
+
+@nest.add_target_with_env(localenv)
+def evaluate_approver(env, outdir, c):
+    targets = [
+        join(outdir, 'eval_repeat.pkl'),
+        join(outdir, 'eval_repeat_log.txt')]
+    cmd = [
+        'python evaluate_approver.py',
+        '--data ${SOURCES[0]}',
+        '--approver ${SOURCES[1]}',
+        '--seed',
+        c['seed'] + 2,
+        '--window',
+        SIMULATION_DICT[c['setting']]['window'],
+        '--ni-margin',
+        SIMULATION_DICT[c['setting']]['ni_margin'],
+        '--num-test-obs',
+        NUM_TEST_OBS,
+	'--out-file ${TARGETS[0]}',
+	'--log-file ${TARGETS[1]}']
+    c['aggregate_res']["%s-%s" % (c['setting'], c['mfdr_setting'])] = targets[0]
+    c['aggregate_res_list'].append(targets[0])
+    return env.Command(
+        targets,
+        [
+           c['generate'][0],
+           c['run_mfdr_simulation'][0],
+        ],
+        ' '.join(map(str, cmd)))
+
+nest.pop('mfdr_setting')
+nest.pop('setting')
+nest.pop('seed')
+
+@nest.add_target_with_env(localenv)
+def plot(env, outdir, c):
+    targets = [join(outdir, 'results_test.csv')]
+    result_names = []
+    result_paths = []
+    for approver_name, approver_path in c['aggregate_res'].items():
+        result_names.append(approver_name)
+        approver_path = c['aggregate_res'][approver_name]
+        split_path = approver_path.split("/")
+        split_path[1] = "seed_*"
+        split_path = ["simulation_time_trends"] + split_path
+        result_paths.append("/".join(split_path))
+    sources = c['aggregate_res_list']
+    cmd = [
+        "python plot_simulation.py",
+        '--denom-min 1',
+        '--out-csv ${TARGETS[0]}',
+        '--result-names',
+        ",".join(result_names),
+        '--result-files',
+        ",".join(result_paths)]
+    return env.Command(
+        targets,
+        sources,
+        ' '.join(map(str, cmd)))
