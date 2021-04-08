@@ -1,7 +1,7 @@
 # aACP
-Automatic Algorithm Change Protocols for regulating AI/ML-based Software as a Medical Device
-
-Feng, Jean, Scott Emerson, and Noah Simon. 2019. “Approval Policies for Modifications to Machine Learning-Based Software as a Medical Device: A Study of Bio-Creep.” arXiv [stat.ML]. arXiv. http://arxiv.org/abs/1912.12413.
+Approval policies for modifications to machine learning‐based software as a medical device: A study of bio‐creep, Biometrics, 2020.
+https://onlinelibrary.wiley.com/doi/10.1111/biom.13379
+http://arxiv.org/abs/1912.12413.
 
 ## Installation
 Create a [python virtualenv](https://virtualenv.pypa.io/en/latest/) using the required packages in requirements.txt.
